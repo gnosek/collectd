@@ -56,6 +56,9 @@
 #if HAVE_NET_IF_H
 # include <net/if.h>
 #endif
+#if HAVE_SYS_UN_H
+# include <sys/un.h>
+#endif
 
 #if HAVE_LIBGCRYPT
 # include <gcrypt.h>
@@ -1756,6 +1759,14 @@ static int network_bind_socket (int fd, const struct addrinfo *ai, const int int
 
 	DEBUG ("fd = %i; calling `bind'", fd);
 
+#ifdef AF_UNIX
+        if (ai->ai_family == AF_UNIX)
+        {
+                struct sockaddr_un *sa_un = (struct sockaddr_un *)ai->ai_addr;
+                unlink(sa_un->sun_path); /* ignore errors */
+        }
+#endif
+
 	if (bind (fd, ai->ai_addr, ai->ai_addrlen) == -1)
 	{
 		char errbuf[1024];
@@ -1929,6 +1940,55 @@ static int sockent_init (sockent_t *se, int type) /* {{{ */
 	return (0);
 } /* }}} int sockent_init */
 
+
+/* Wrapper for getaddrinfo() to support binding to Unix sockets */
+static int collectd_getaddrinfo(const char *node, const char *service,
+                const struct addrinfo *hints, struct addrinfo **res) /* {{{ */
+{
+        if (!strcmp(node, "/local"))
+        {
+#ifdef AF_UNIX
+                struct sockaddr_un *sa_un;
+
+                if (service[0] != '/')
+                {
+                        errno = EINVAL;
+                        return EAI_SYSTEM;
+                }
+                *res = malloc(sizeof **res);
+                if (!*res)
+                {
+                        return EAI_MEMORY;
+                }
+                sa_un = calloc(1, sizeof *sa_un);
+                if (!sa_un)
+                {
+                        free(*res);
+                        return EAI_MEMORY;
+                }
+                (*res)->ai_next = NULL;
+                (*res)->ai_family = AF_UNIX;
+                (*res)->ai_socktype = hints->ai_socktype;
+                (*res)->ai_protocol = 0;
+                (*res)->ai_canonname = NULL;
+
+                sa_un->sun_family = AF_UNIX;
+                strncpy(sa_un->sun_path, service, sizeof(sa_un->sun_path)-1);
+
+                (*res)->ai_addr = (struct sockaddr *)sa_un;
+                (*res)->ai_addrlen = sizeof(*sa_un);
+                return (0);
+#else
+                return EAI_FAMILY;
+#endif
+        }
+        else
+        {
+                return getaddrinfo(node, service, hints, res);
+        }
+} /* }}} int collectd_getaddrinfo */
+
+
 /* Open the file descriptors for a initialized sockent structure. */
 static int sockent_open (sockent_t *se) /* {{{ */
 {
@@ -2010,7 +2070,7 @@ static int sockent_open (sockent_t *se) /* {{{ */
 	ai_hints.ai_socktype = SOCK_DGRAM;
 	ai_hints.ai_protocol = IPPROTO_UDP;
 
-	ai_return = getaddrinfo (node, service, &ai_hints, &ai_list);
+	ai_return = collectd_getaddrinfo (node, service, &ai_hints, &ai_list);
 	if (ai_return != 0)
 	{
 		ERROR ("network plugin: getaddrinfo (%s, %s) failed: %s",
