@@ -49,6 +49,14 @@ struct mr_regex_s
 	mr_regex_t *next;
 };
 
+struct mr_metadata_regex_s;
+typedef struct mr_metadata_regex_s mr_metadata_regex_t;
+struct mr_metadata_regex_s {
+	char *key;
+	mr_regex_t *regex;
+	mr_metadata_regex_t *next;
+};
+
 struct mr_match_s;
 typedef struct mr_match_s mr_match_t;
 struct mr_match_s
@@ -58,6 +66,7 @@ struct mr_match_s
 	mr_regex_t *plugin_instance;
 	mr_regex_t *type;
 	mr_regex_t *type_instance;
+	mr_metadata_regex_t *meta;
 	_Bool invert;
 };
 
@@ -79,6 +88,8 @@ static void mr_free_regex (mr_regex_t *r) /* {{{ */
 
 static void mr_free_match (mr_match_t *m) /* {{{ */
 {
+	mr_metadata_regex_t *meta;
+
 	if (m == NULL)
 		return;
 
@@ -87,6 +98,13 @@ static void mr_free_match (mr_match_t *m) /* {{{ */
 	mr_free_regex (m->plugin_instance);
 	mr_free_regex (m->type);
 	mr_free_regex (m->type_instance);
+
+	for (meta=m->meta; meta; meta=meta->next)
+	{
+		free (meta->key);
+		mr_free_regex (meta->regex);
+	}
+	free (m->meta);
 
 	free (m);
 } /* }}} void mr_free_match */
@@ -123,32 +141,26 @@ static int mr_match_regexen (mr_regex_t *re_head, /* {{{ */
 	return (FC_MATCH_MATCHES);
 } /* }}} int mr_match_regexen */
 
-static int mr_config_add_regex (mr_regex_t **re_head, /* {{{ */
-		oconfig_item_t *ci)
+static int mr_config_parse_regex (mr_regex_t **re_head, /* {{{ */
+		const char *re_str, const char *name)
 {
 	mr_regex_t *re;
 	int status;
 
-	if ((ci->values_num != 1) || (ci->values[0].type != OCONFIG_TYPE_STRING))
-	{
-		log_warn ("`%s' needs exactly one string argument.", ci->key);
-		return (-1);
-	}
-
 	re = (mr_regex_t *) malloc (sizeof (*re));
 	if (re == NULL)
 	{
-		log_err ("mr_config_add_regex: malloc failed.");
+		log_err ("mr_config_parse_regex: malloc failed.");
 		return (-1);
 	}
 	memset (re, 0, sizeof (*re));
 	re->next = NULL;
 
-	re->re_str = strdup (ci->values[0].value.string);
+	re->re_str = strdup (re_str);
 	if (re->re_str == NULL)
 	{
 		free (re);
-		log_err ("mr_config_add_regex: strdup failed.");
+		log_err ("mr_config_parse_regex: strdup failed.");
 		return (-1);
 	}
 
@@ -159,7 +171,7 @@ static int mr_config_add_regex (mr_regex_t **re_head, /* {{{ */
 		regerror (status, &re->re, errmsg, sizeof (errmsg));
 		errmsg[sizeof (errmsg) - 1] = 0;
 		log_err ("Compiling regex `%s' for `%s' failed: %s.", 
-				re->re_str, ci->key, errmsg);
+				re->re_str, name, errmsg);
 		free (re->re_str);
 		free (re);
 		return (-1);
@@ -181,7 +193,61 @@ static int mr_config_add_regex (mr_regex_t **re_head, /* {{{ */
 	}
 
 	return (0);
+} /* }}} int mr_config_parse_regex */
+
+static int mr_config_add_regex (mr_regex_t **re_head, /* {{{ */
+		oconfig_item_t *ci)
+{
+	if ((ci->values_num != 1) || (ci->values[0].type != OCONFIG_TYPE_STRING))
+	{
+		log_warn ("`%s' needs exactly one string argument.", ci->key);
+		return (-1);
+	}
+
+	return mr_config_parse_regex(re_head, ci->values[0].value.string, ci->key);
 } /* }}} int mr_config_add_regex */
+
+static int mr_config_add_metadata_regex (mr_metadata_regex_t **meta_head, /* {{{ */
+	oconfig_item_t *ci)
+{
+	mr_metadata_regex_t *meta;
+	char *key;
+
+	if ((ci->values_num != 2) || (ci->values[0].type != OCONFIG_TYPE_STRING)
+		 || (ci->values[1].type != OCONFIG_TYPE_STRING))
+	{
+		log_warn ("`%s' needs exactly two string arguments.", ci->key);
+		return (-1);
+	}
+
+	key = strdup(ci->values[0].value.string);
+	if (!key)
+	{
+		log_warn ("match_regex: Out of memory");
+		return (-1);
+	}
+
+	for (meta=*meta_head; meta; meta=meta->next)
+	{
+		if (!strcmp(meta->key, key))
+			break;
+	}
+
+	if (!meta)
+	{
+		meta = malloc(sizeof *meta);
+		if (!meta)
+		{
+			log_warn ("match_regex: Out of memory");
+			return (-1);
+		}
+		meta->key = key;
+		meta->regex = NULL;
+		meta->next = *meta_head;
+		*meta_head = meta;
+	}
+	return mr_config_parse_regex(&meta->regex, ci->values[1].value.string, ci->key);
+} /* }}} int mr_config_add_metadata_regex */
 
 static int mr_create (const oconfig_item_t *ci, void **user_data) /* {{{ */
 {
@@ -215,6 +281,8 @@ static int mr_create (const oconfig_item_t *ci, void **user_data) /* {{{ */
 			status = mr_config_add_regex (&m->type, child);
 		else if (strcasecmp ("TypeInstance", child->key) == 0)
 			status = mr_config_add_regex (&m->type_instance, child);
+		else if (strcasecmp ("Metadata", child->key) == 0)
+			status = mr_config_add_metadata_regex (&m->meta, child);
 		else if (strcasecmp ("Invert", child->key) == 0)
 			status = cf_util_get_boolean(child, &m->invert);
 		else
@@ -235,7 +303,8 @@ static int mr_create (const oconfig_item_t *ci, void **user_data) /* {{{ */
 				&& (m->plugin == NULL)
 				&& (m->plugin_instance == NULL)
 				&& (m->type == NULL)
-				&& (m->type_instance == NULL))
+				&& (m->type_instance == NULL)
+				&& (m->meta == NULL))
 		{
 			log_err ("No (valid) regular expressions have been configured. "
 					"This match will be ignored.");
@@ -270,6 +339,7 @@ static int mr_match (const data_set_t __attribute__((unused)) *ds, /* {{{ */
 	mr_match_t *m;
 	int match_value = FC_MATCH_MATCHES;
 	int nomatch_value = FC_MATCH_NO_MATCH;
+	mr_metadata_regex_t *meta_match;
 
 	if ((user_data == NULL) || (*user_data == NULL))
 		return (-1);
@@ -294,6 +364,19 @@ static int mr_match (const data_set_t __attribute__((unused)) *ds, /* {{{ */
 	if (mr_match_regexen (m->type_instance,
 				vl->type_instance) == FC_MATCH_NO_MATCH)
 		return (nomatch_value);
+
+	for (meta_match=m->meta; meta_match; meta_match=meta_match->next)
+	{
+		char *value_meta = NULL;
+		int status;
+
+		status = meta_data_get_string (vl->meta, meta_match->key, &value_meta);
+		if (status != 0)
+			return (nomatch_value);
+
+		if (mr_match_regexen (meta_match->regex, value_meta) == FC_MATCH_NO_MATCH)
+			return (nomatch_value);
+	}
 
 	return (match_value);
 } /* }}} int mr_match */
