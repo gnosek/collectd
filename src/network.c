@@ -359,7 +359,7 @@ static _Bool check_send_okay (const value_list_t *vl) /* {{{ */
   return (!received);
 } /* }}} _Bool check_send_okay */
 
-static int network_dispatch_values (value_list_t *vl, /* {{{ */
+static int network_dispatch_values (struct sockent *se, value_list_t *vl, /* {{{ */
     const char *username)
 {
   int status;
@@ -411,6 +411,24 @@ static int network_dispatch_values (value_list_t *vl, /* {{{ */
       vl->meta = NULL;
       return (status);
     }
+  }
+
+  status = meta_data_add_string (vl->meta, "network:node", se->node);
+  if (status != 0)
+  {
+    ERROR ("network plugin: meta_data_add_string failed.");
+    meta_data_destroy (vl->meta);
+    vl->meta = NULL;
+    return (status);
+  }
+
+  status = meta_data_add_string (vl->meta, "network:service", se->service);
+  if (status != 0)
+  {
+    ERROR ("network plugin: meta_data_add_string failed.");
+    meta_data_destroy (vl->meta);
+    vl->meta = NULL;
+    return (status);
   }
 
   plugin_dispatch_values (vl);
@@ -1378,7 +1396,7 @@ static int parse_packet (sockent_t *se, /* {{{ */
 			if (status != 0)
 				break;
 
-			network_dispatch_values (&vl, username);
+			network_dispatch_values (se, &vl, username);
 
 			sfree (vl.values);
 		}
