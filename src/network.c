@@ -59,6 +59,7 @@
 #if HAVE_SYS_UN_H
 # include <sys/un.h>
 #endif
+#include <grp.h>
 
 #if HAVE_LIBGCRYPT
 # include <gcrypt.h>
@@ -126,6 +127,10 @@ typedef struct sockent
 	char *node;
 	char *service;
 	int interface;
+
+        char *group;
+        int perms;
+        _Bool delete;
 
 	union
 	{
@@ -1743,10 +1748,11 @@ static int network_set_interface (const sockent_t *se, const struct addrinfo *ai
 	return (0);
 } /* }}} network_set_interface */
 
-static int network_bind_socket (int fd, const struct addrinfo *ai, const int interface_idx)
+static int network_bind_socket (int fd, const struct addrinfo *ai, const struct sockent *se)
 {
 	int loop = 0;
 	int yes  = 1;
+        int interface_idx = se->interface;
 
 	/* allow multiple sockets to use the same PORT number */
 	if (setsockopt (fd, SOL_SOCKET, SO_REUSEADDR,
@@ -1760,7 +1766,7 @@ static int network_bind_socket (int fd, const struct addrinfo *ai, const int int
 	DEBUG ("fd = %i; calling `bind'", fd);
 
 #ifdef AF_UNIX
-        if (ai->ai_family == AF_UNIX)
+        if (ai->ai_family == AF_UNIX && se->delete)
         {
                 struct sockaddr_un *sa_un = (struct sockaddr_un *)ai->ai_addr;
                 unlink(sa_un->sun_path); /* ignore errors */
@@ -1869,6 +1875,55 @@ static int network_bind_socket (int fd, const struct addrinfo *ai, const int int
 
 			return (0);
 		}
+#ifdef AF_UNIX
+        }
+        else if (ai->ai_family == AF_UNIX)
+        {
+		char *grpname;
+		struct group *g;
+		struct group sg;
+		char grbuf[2048];
+                struct sockaddr_un *sa_un;
+                gid_t gid;
+
+                sa_un = (struct sockaddr_un *) ai->ai_addr;
+
+                chmod (sa_un->sun_path, se->perms);
+
+		grpname = (se->group != NULL) ? se->group : COLLECTD_GRP_NAME;
+		g = NULL;
+
+		if (getgrnam_r (grpname, &sg, grbuf, sizeof (grbuf), &g) != 0)
+		{
+			char errbuf[1024];
+			WARNING ("network plugin: getgrnam_r (%s) failed: %s", grpname,
+					sstrerror (errno, errbuf, sizeof (errbuf)));
+			return (-1);
+		}
+		if (g != NULL)
+		{
+                        gid = g->gr_gid;
+                }
+                else
+                {
+                        errno = 0;
+                        gid = strtol(grpname, NULL, 10);
+                        if (errno != 0)
+                        {
+                                WARNING ("network plugin: No such group: `%s'",
+                                                grpname);
+                                return (-1);
+                        }
+		}
+
+		if (chown (sa_un->sun_path, (uid_t) -1, gid) != 0)
+		{
+			char errbuf[1024];
+			WARNING ("network plugin: chown (%s, -1, %i) failed: %s",
+					sa_un->sun_path, (int) gid,
+					sstrerror (errno, errbuf, sizeof (errbuf)));
+		}
+#endif
 	}
 
 #if defined(HAVE_IF_INDEXTONAME) && HAVE_IF_INDEXTONAME && defined(SO_BINDTODEVICE)
@@ -1912,6 +1967,9 @@ static int sockent_init (sockent_t *se, int type) /* {{{ */
 	se->node = NULL;
 	se->service = NULL;
 	se->interface = 0;
+        se->group = NULL;
+        se->perms = S_IRWXU | S_IRWXG;
+        se->delete = 0;
 	se->next = NULL;
 
 	if (type == SOCKENT_TYPE_SERVER)
@@ -2109,7 +2167,7 @@ static int sockent_open (sockent_t *se) /* {{{ */
 				continue;
 			}
 
-			status = network_bind_socket (*tmp, ai_ptr, se->interface);
+			status = network_bind_socket (*tmp, ai_ptr, se);
 			if (status != 0)
 			{
 				close (*tmp);
@@ -2953,6 +3011,17 @@ static int network_config_set_security_level (oconfig_item_t *ci, /* {{{ */
 } /* }}} int network_config_set_security_level */
 #endif /* HAVE_LIBGCRYPT */
 
+static int network_config_set_socket_perms (oconfig_item_t *ci, /* {{{ */
+    int *retval)
+{
+  char *value = NULL;
+  if (cf_util_get_string (ci, &value) == -1)
+    return (-1);
+
+  *retval = (int) strtol (value, NULL, 8);
+  return (0);
+} /* }}} network_config_set_socket_perms */
+
 static int network_config_add_listen (const oconfig_item_t *ci) /* {{{ */
 {
   sockent_t *se;
@@ -2995,6 +3064,12 @@ static int network_config_add_listen (const oconfig_item_t *ci) /* {{{ */
     if (strcasecmp ("Interface", child->key) == 0)
       network_config_set_interface (child,
           &se->interface);
+    else if (strcasecmp ("SocketGroup", child->key) == 0)
+      cf_util_get_string (child, &se->group);
+    else if (strcasecmp ("SocketPerms", child->key) == 0)
+      network_config_set_socket_perms (child, &se->perms);
+    else if (strcasecmp ("DeleteSocket", child->key) == 0)
+      cf_util_get_boolean (child, &se->delete);
     else
     {
       WARNING ("network plugin: Option `%s' is not allowed here.",
